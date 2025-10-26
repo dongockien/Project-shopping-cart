@@ -1,0 +1,4 @@
+{"level":"info","time":"2025-09-29T03:43:07Z","message":"Mail service initialized successfully"}
+{"level":"info","trace_id":"","duration":6313.799277,"operation":"send_email","to":[{"email":"contact.han11@gmail.com"}],"subject":"Password Reset Request","category":"","time":"2025-09-29T03:44:12Z","message":"Email send successfully"}
+{"level":"info","time":"2025-09-29T07:30:40Z","message":"Mail service initialized successfully"}
+{"level":"info","trace_id":"ad7e321d-580e-471e-a172-01852ca31ab0","duration":6532.984936,"operation":"send_email","to":[{"email":"contact.han11@gmail.com"}],"subject":"Password Reset Request","category":"","time":"2025-09-29T07:35:26Z","message":"Email send successfully"}

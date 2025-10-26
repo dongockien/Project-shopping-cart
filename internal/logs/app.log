@@ -1,0 +1,18 @@
+{"level":"info","time":"2025-09-25T15:26:04+07:00","message":"Loaded successfully .env"}
+{"level":"info","time":"2025-09-25T15:26:04+07:00","message":"Connected Database Postgresql"}
+{"level":"info","time":"2025-09-25T15:26:04+07:00","message":"COnnected Redis"}
+{"level":"info","time":"2025-09-25T15:26:04+07:00","message":"Server is running at :8080"}
+{"level":"warn","time":"2025-09-25T15:26:57+07:00","message":"Shutdown signal received ..."}
+{"level":"info","time":"2025-09-25T15:26:57+07:00","message":"Server exited gracefully"}
+{"level":"info","time":"2025-09-25T08:28:55Z","message":"Loaded successfully .env"}
+{"level":"info","time":"2025-09-25T08:28:55Z","message":"Connected Database Postgresql"}
+{"level":"info","time":"2025-09-25T08:28:55Z","message":"COnnected Redis"}
+{"level":"info","time":"2025-09-25T08:28:55Z","message":"Server is running at :8080"}
+{"level":"info","time":"2025-09-29T03:43:07Z","message":"Loaded successfully .env"}
+{"level":"info","time":"2025-09-29T03:43:07Z","message":"Connected Database Postgresql"}
+{"level":"info","time":"2025-09-29T03:43:07Z","message":"Connected Redis"}
+{"level":"info","time":"2025-09-29T03:43:07Z","message":"Server is running at :8080"}
+{"level":"info","time":"2025-09-29T07:30:40Z","message":"Loaded successfully .env"}
+{"level":"info","time":"2025-09-29T07:30:40Z","message":"Connected Database Postgresql"}
+{"level":"info","time":"2025-09-29T07:30:40Z","message":"Connected Redis"}
+{"level":"info","time":"2025-09-29T07:30:40Z","message":"Server is running at :8080"}

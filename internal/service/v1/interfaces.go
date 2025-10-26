@@ -1,0 +1,25 @@
+package v1service
+
+import (
+	"dnk.com/hoc-golang/internal/db/sqlc"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+type UserService interface {
+	GetAllUsers(ctx *gin.Context, search, order_by, sort string, page, limit int32, deleted bool) ([]sqlc.User, int32, error)
+	CreateUser(ctx *gin.Context, input sqlc.CreateUserParams) (sqlc.User, error)
+	GetUserByUuid(ctx *gin.Context, uuid uuid.UUID) (sqlc.User, error)
+	UpdateUser(ctx *gin.Context, input sqlc.UpdateUserParams) (sqlc.User, error)
+	SortDeleteUser(ctx *gin.Context, uuid uuid.UUID) (sqlc.User, error)
+	RestoreUser(ctx *gin.Context, uuid uuid.UUID) (sqlc.User, error)
+	DeleteUser(ctx *gin.Context, uuid uuid.UUID) error
+}
+
+type AuthService interface {
+	Login(ctx *gin.Context, email, password string) (string, string, int, error)
+	RefreshToken(ctx *gin.Context, token string) (string, string, int, error) 
+	Logout(ctx *gin.Context, refreshToken string) error
+	RequestForgotPassword(ctx *gin.Context, email string) error
+	ResetPassword(ctx *gin.Context, token, password string) error
+	}	

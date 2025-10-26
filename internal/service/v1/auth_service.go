@@ -1,0 +1,290 @@
+package v1service
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"dnk.com/hoc-golang/internal/db/sqlc"
+	"dnk.com/hoc-golang/internal/repository"
+	"dnk.com/hoc-golang/internal/utils"
+	"dnk.com/hoc-golang/pkg/auth"
+	"dnk.com/hoc-golang/pkg/cache"
+	"dnk.com/hoc-golang/pkg/mail"
+	"dnk.com/hoc-golang/pkg/rabbitmq"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/time/rate"
+)
+
+type authService struct {
+	userRepo     repository.UserRepository
+	tokenService auth.TokenService
+	cacheService cache.RedisCacheService
+	mailService  mail.EmailProviderService
+	rabbitmq     rabbitmq.RabbitMQService
+}
+
+type LoginAttempt struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+var (
+	mu               sync.Mutex
+	clients          = make(map[string]*LoginAttempt)
+	LoginAttemptLTTL = 5 * time.Minute
+	MaxLoginAttempt  = 5
+)
+
+func NewAuthService(repo repository.UserRepository, tokenService auth.TokenService, cacheService cache.RedisCacheService, mailService mail.EmailProviderService, rabbitmqService rabbitmq.RabbitMQService) *authService {
+	return &authService{
+		userRepo:     repo,
+		tokenService: tokenService,
+		cacheService: cacheService,
+		mailService:  mailService,
+		rabbitmq:    rabbitmqService,
+	}
+}
+
+func (as *authService) getClientIP(ctx *gin.Context) string {
+	ip := ctx.ClientIP()
+	if ip == "" {
+		ip = ctx.Request.RemoteAddr
+	}
+
+	return ip
+}
+
+func (as *authService) getLoginAttempt(ip string) *rate.Limiter {
+	mu.Lock()
+	defer mu.Unlock()
+
+	client, exists := clients[ip]
+	if !exists {
+
+		limiter := rate.NewLimiter(rate.Limit(float32(MaxLoginAttempt)/float32(LoginAttemptLTTL.Seconds())), MaxLoginAttempt) //
+		newClient := &LoginAttempt{limiter, time.Now()}
+		clients[ip] = newClient
+		return limiter
+	}
+
+	client.lastSeen = time.Now()
+	return client.limiter
+}
+
+func (as *authService) checkLoginAttempt(ip string) error {
+	limiter := as.getLoginAttempt(ip)
+
+	if !limiter.Allow() {
+		return utils.NewError("Too many login attempts. Please retry again later", utils.ErrCodeTooManyRequests)
+	}
+	return nil
+}
+
+func (as *authService) CleanupClients(ip string) {
+
+	mu.Lock()
+	defer mu.Unlock()
+	delete(clients, ip)
+
+}
+
+func (as *authService) Login(ctx *gin.Context, email, password string) (string, string, int, error) {
+	context := ctx.Request.Context()
+	ip := as.getClientIP(ctx)
+
+	if err := as.checkLoginAttempt(ip); err != nil {
+		return "", "", 0, err
+	}
+	email = utils.NormalizeString(email)
+	user, err := as.userRepo.GetByEmail(context, email)
+	if err != nil {
+		as.getLoginAttempt(ip)
+		return "", "", 0, utils.NewError("Invalid email or password", utils.ErrCodeUnauthorized)
+	}
+
+	if err = bcrypt.CompareHashAndPassword([]byte(user.UserPassword), []byte(password)); err != nil {
+		as.getLoginAttempt(ip)
+		return "", "", 0, utils.NewError("Invalid email or password", utils.ErrCodeUnauthorized)
+	}
+
+	accessToken, err := as.tokenService.GenerateAccessToken(user)
+	if err != nil {
+		return "", "", 0, utils.WrapError(err, "Unable to create access token", utils.ErrCodeInternal)
+	}
+
+	refreshToken, err := as.tokenService.GenerateRefreshToken(user)
+	if err != nil {
+		return "", "", 0, utils.WrapError(err, "Unable to create access token", utils.ErrCodeInternal)
+	}
+
+	if err := as.tokenService.StoreRefreshToken(refreshToken); err != nil {
+		return "", "", 0, utils.WrapError(err, "Cannot save refresh token", utils.ErrCodeInternal)
+	}
+
+	as.CleanupClients(ip)
+
+	return accessToken, refreshToken.Token, int(auth.AccessTokenTTL.Seconds()), nil
+}
+
+func (as *authService) Logout(ctx *gin.Context, refreshToken string) error {
+	authHeader := ctx.GetHeader("Authorization")
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+
+		return utils.NewError("Missing Authorization header", utils.ErrCodeUnauthorized)
+	}
+
+	accessToken := strings.TrimPrefix(authHeader, "Bearer ")
+
+	_, claims, err := as.tokenService.ParseToken(accessToken)
+	if err != nil {
+		return utils.NewError("Invalid access token", utils.ErrCodeUnauthorized)
+	}
+
+	if jti, ok := claims["jti"].(string); ok {
+		expUnix, _ := claims["exp"].(float64)
+		exp := time.Unix(int64(expUnix), 0)
+		key := "blacklist:" + jti
+		ttl := time.Until(exp)
+		as.cacheService.Set(key, "revoked", ttl)
+	}
+	_, err = as.tokenService.ValidateRefreshToken(refreshToken)
+	if err != nil {
+		return utils.NewError("Refresh token is invalid or revoked", utils.ErrCodeUnauthorized)
+	}
+	if err := as.tokenService.RevokeRefreshToken(refreshToken); err != nil {
+		return utils.NewError("Unable to revoke token", utils.ErrCodeUnauthorized)
+	}
+	return nil
+}
+
+func (as *authService) RefreshToken(ctx *gin.Context, refreshTokenString string) (string, string, int, error) {
+	context := ctx.Request.Context()
+
+	// Kiểm tra refresh token, trả thông tin user_uuid
+	token, err := as.tokenService.ValidateRefreshToken(refreshTokenString)
+	if err != nil {
+		return "", "", 0, utils.NewError("Refresh token is invalid or revoked", utils.ErrCodeUnauthorized)
+	}
+
+	// Lấy thông tin user
+	userUuid, _ := uuid.Parse(token.UserUUID)
+	user, err := as.userRepo.GetByUuid(context, userUuid)
+	if err != nil {
+		return "", "", 0, utils.NewError("User not found", utils.ErrCodeUnauthorized)
+	}
+
+	// Tạo access token mới
+	accessToken, err := as.tokenService.GenerateAccessToken(user)
+	if err != nil {
+		return "", "", 0, utils.WrapError(err, "Unable to create access token", utils.ErrCodeInternal)
+	}
+	// Tạo refresh token mới
+	refreshToken, err := as.tokenService.GenerateRefreshToken(user)
+	if err != nil {
+		return "", "", 0, utils.WrapError(err, "Unable to create access token", utils.ErrCodeInternal)
+	}
+	// Vô hiệu hóa refresh token cũ
+	if err := as.tokenService.RevokeRefreshToken(refreshTokenString); err != nil {
+		return "", "", 0, utils.WrapError(err, "Unable to create revoke token", utils.ErrCodeInternal)
+	}
+	// Lưu refresh token mới
+	if err := as.tokenService.StoreRefreshToken(refreshToken); err != nil {
+		return "", "", 0, utils.WrapError(err, "Cannot save refresh token", utils.ErrCodeInternal)
+	}
+	return accessToken, refreshToken.Token, int(auth.AccessTokenTTL.Seconds()), nil
+}
+
+func (as *authService) RequestForgotPassword(ctx *gin.Context, email string) error {
+	context := ctx.Request.Context()
+
+	rateLimitKey := fmt.Sprintf("reset:ratelimit:%s", email)
+	if exists, err := as.cacheService.Exists(rateLimitKey); err == nil && exists {
+
+		return utils.NewError("Please wait before requesting another password reset", utils.ErrCodeTooManyRequests)
+	}
+
+	user, err := as.userRepo.GetByEmail(context, email)
+	if err != nil {
+
+		return utils.NewError("Email not found", utils.ErrCodeNotFound)
+	}
+
+	token, err := utils.GenerateRandomString(16)
+	if err != nil {
+
+		return utils.NewError("Failed to generate reset token", utils.ErrCodeInternal)
+	}
+
+	err = as.cacheService.Set("reset:"+token, user.UserUuid, 1*time.Hour)
+	if err != nil {
+
+		return utils.NewError("Failed to store reset token", utils.ErrCodeInternal)
+	}
+	err = as.cacheService.Set(rateLimitKey, "1", 5*time.Minute)
+	if err != nil {
+
+		return utils.NewError("Failed to store rate limit reset password", utils.ErrCodeInternal)
+	}
+
+	resetLink := fmt.Sprintf("http://abc.com/view-to-reset-password?Token=%s", token)
+
+	mailContent := &mail.Email{
+		To: []mail.Address{
+			{Email: email},
+		},
+		Subject: "Password Reset Request",
+		Text: fmt.Sprintf("Hi %s, \n\n You requested to reset your password. Please click the link below to reset it:\n%s\n\n The link will expire in 1 hour. \n\n Best regards, \nCode With Kien Team",
+			user.UserEmail,
+			resetLink),
+	}
+
+	// Cần update thành publish vào rabbitmq
+	
+if err := 	as.rabbitmq.Publish(ctx, "auth_email_queue", mailContent); err != nil {
+	return utils.NewError("Failed to send password reset email", utils.ErrCodeInternal)
+}
+	
+	// if err := as.mailService.SendMail(context, mailContent); err != nil {
+	// 	return utils.NewError("Failed to send password reset email", utils.ErrCodeInternal)
+	// }
+
+	return nil
+}
+
+func (as *authService) ResetPassword(ctx *gin.Context, token, password string) error {
+	context := ctx.Request.Context()
+	var userUUIDStr string
+	err := as.cacheService.Get("reset:"+token, &userUUIDStr)
+	if err == redis.Nil || userUUIDStr == "" {
+		return utils.NewError("Invalid or expired token", utils.ErrCodeNotFound)
+	}
+	if err != nil {
+		return utils.NewError("Failed to get reset token", utils.ErrCodeInternal)
+	}
+
+	userUuid, err := uuid.Parse(userUUIDStr)
+	if err != nil {
+		return utils.WrapError(err, "Uuid is invalid", utils.ErrCodeInternal)
+	}
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return utils.WrapError(err, "Failed to hash password", utils.ErrCodeInternal)
+	}
+	input := sqlc.UpdatePasswordParams{
+		UserPassword: string(hashedPassword),
+		UserUuid:     userUuid,
+	}
+	_, err = as.userRepo.UpdatePassword(context, input)
+	if err != nil {
+		return utils.NewError("Failed to update new password", utils.ErrCodeInternal)
+	}
+
+	as.cacheService.Clear("reset:" + token)
+
+	return nil
+}
